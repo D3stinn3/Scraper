@@ -1038,6 +1038,121 @@ class ARCATScraper:
         self.building_product_categories = categories
         return categories
 
+    def scrape_related_csi_divisions(self) -> list[Division]:
+        """
+        Scrape Related CSI Divisions from the Building Product Categories page.
+
+        Source: https://www.arcat.com/products/building_products_categories
+        These are the divisions shown in the "Related CSI Divisions" sidebar.
+
+        Returns divisions with URLs like:
+        /content-type/product/existing-conditions-02/existing-conditions-020000
+        """
+        url = f"{BASE_URL}/products/building_products_categories"
+        logger.info(f"Scraping Related CSI Divisions from {url}")
+
+        soup = self._make_request(url)
+        if not soup:
+            return []
+
+        divisions = []
+
+        # Find CSI division links matching pattern: /content-type/product/xxx-XX/xxx-XXXXXX
+        csi_links = soup.find_all('a', href=re.compile(r'/content-type/product/[\w-]+-\d+/[\w-]+-\d+'))
+
+        seen_urls = set()
+        for link in csi_links:
+            href = link.get('href', '')
+            if href in seen_urls:
+                continue
+            seen_urls.add(href)
+
+            text = link.get_text(strip=True)
+            full_url = f"{BASE_URL}{href}"
+
+            # Parse division code and name from text like "02 - EXISTING CONDITIONS"
+            match = re.match(r'^(\d+)\s*-\s*(.+)$', text)
+            if match:
+                code = match.group(1)
+                name = match.group(2).strip()
+
+                # Format code as "XX 00 00" (e.g., "02 00 00")
+                formatted_code = f"{code.zfill(2)} 00 00"
+
+                division = Division(
+                    code=formatted_code,
+                    name=name,
+                    url=full_url
+                )
+                divisions.append(division)
+                logger.info(f"Found division: {formatted_code} - {name}")
+
+        self.divisions = divisions
+        return divisions
+
+    def scrape_division_manufacturers(self, division: Division) -> Division:
+        """
+        Scrape manufacturers/companies from a CSI division page.
+
+        Source URLs like:
+        https://www.arcat.com/content-type/product/existing-conditions-02/existing-conditions-020000
+
+        This gets the list of companies (manufacturers) for a specific CSI division.
+        """
+        logger.info(f"Scraping manufacturers for division: {division.code} - {division.name}")
+
+        soup = self._make_request(division.url)
+        if not soup:
+            return division
+
+        # Find company links - pattern: /company/{company-slug}-{id}
+        # Filter to only get main company links, not sub-pages like /cad, /bim, etc.
+        company_links = soup.find_all('a', href=re.compile(r'/company/[\w-]+-\d+(?:\?|$)'))
+
+        seen_companies = {}
+        skipped_associations = 0
+
+        for link in company_links:
+            href = link.get('href', '')
+            company_name = link.get_text(strip=True)
+
+            # Skip empty names or sub-page links
+            if not company_name or '/cad' in href or '/bim' in href or '/spec' in href:
+                continue
+
+            # Clean up URL (remove query params for deduplication)
+            base_href = href.split('?')[0]
+            if base_href in seen_companies:
+                continue
+
+            # Filter out associations
+            if self._is_association(company_name):
+                skipped_associations += 1
+                logger.debug(f"Skipping association: {company_name}")
+                continue
+
+            # Extract company ID from URL
+            id_match = re.search(r'-(\d+)(?:\?|$)', href)
+            company_id = id_match.group(1) if id_match else ""
+
+            full_url = f"{BASE_URL}{href}" if href.startswith('/') else href
+
+            company = Company(
+                name=company_name,
+                url=full_url,
+                company_id=company_id,
+                building_product_category=f"{division.code} - {division.name}"
+            )
+            seen_companies[base_href] = company
+
+        division.companies = list(seen_companies.values())
+
+        if skipped_associations > 0:
+            logger.info(f"Filtered out {skipped_associations} associations")
+
+        logger.info(f"Found {len(division.companies)} companies in division {division.code}")
+        return division
+
     def scrape_category_subcategories(self, category: BuildingProductCategory) -> BuildingProductCategory:
         """Scrape subcategories and related CSI divisions for a building product category"""
         logger.info(f"Scraping subcategories for category: {category.name}")
@@ -1381,8 +1496,12 @@ class ARCATScraper:
         # Write data - one company per row
         row = 2
         for division in self.divisions:
-            # Format division code as "XX 00 00" (e.g., "02 00 00")
-            formatted_code = f"{division.code.zfill(2)} 00 00" if division.code.isdigit() else division.code
+            # Division code may already be formatted as "XX 00 00" or just "XX"
+            # If it's just digits, format it; otherwise use as-is
+            if division.code.isdigit():
+                formatted_code = f"{division.code.zfill(2)} 00 00"
+            else:
+                formatted_code = division.code  # Already formatted or special format
 
             if not division.companies:
                 # Write division even if no companies found
@@ -1567,16 +1686,20 @@ def main():
 
 def scrape_csi_only(scraper, max_divisions: int = None, max_companies: int = None, resume: bool = False):
     """
-    Scrape CSI divisions only - the cleanest and most focused approach.
+    Scrape CSI divisions from Building Product Categories page.
 
-    This scrapes from https://www.arcat.com/content-type/spec which has ~28 CSI divisions.
-    Each division has companies listed. Output format matches the reference Excel structure.
+    Navigation path:
+    1. https://www.arcat.com/products/building_products_categories
+    2. → Related CSI Divisions (sidebar) e.g., "02 - EXISTING CONDITIONS"
+    3. → /content-type/product/existing-conditions-02/existing-conditions-020000
+    4. → Company pages e.g., /company/invisible-structures-inc-33364
 
-    Expected output: ~2,000-5,000 companies total (much more manageable than 450K)
+    Expected output: ~500-2,000 companies total (focused on building product manufacturers)
     """
     logger.info("=" * 60)
-    logger.info("STARTING CSI-ONLY SCRAPE (Recommended Mode)")
-    logger.info("Source: https://www.arcat.com/content-type/spec")
+    logger.info("STARTING CSI-ONLY SCRAPE (Building Product Categories)")
+    logger.info("Source: https://www.arcat.com/products/building_products_categories")
+    logger.info("Path: Building Products → Related CSI Divisions → Manufacturers")
     logger.info("=" * 60)
 
     # Track already scraped companies for resume
@@ -1593,22 +1716,20 @@ def scrape_csi_only(scraper, max_divisions: int = None, max_companies: int = Non
             logger.info(f"Resuming with {len(scraped_company_urls)} already scraped companies")
 
     try:
-        # Get all CSI divisions (should be ~28)
+        # Step 1: Get Related CSI Divisions from Building Product Categories page
         if not scraper.divisions:
-            scraper.scrape_divisions()
+            scraper.scrape_related_csi_divisions()
 
-        # Filter to valid divisions only (code 00-49)
-        valid_divisions = [d for d in scraper.divisions if d.code.isdigit() and int(d.code) <= 49]
-        logger.info(f"Found {len(valid_divisions)} valid CSI divisions")
+        logger.info(f"Found {len(scraper.divisions)} Related CSI divisions")
 
-        divisions_to_process = valid_divisions[:max_divisions] if max_divisions else valid_divisions
+        divisions_to_process = scraper.divisions[:max_divisions] if max_divisions else scraper.divisions
 
         # First pass: count total companies
         logger.info("Counting companies across all divisions...")
         total_companies = 0
         for division in divisions_to_process:
             if not division.companies:
-                scraper.scrape_division_specs(division)
+                scraper.scrape_division_manufacturers(division)
             companies = division.companies[:max_companies] if max_companies else division.companies
             total_companies += len([c for c in companies if c.url not in scraped_company_urls])
 
@@ -1617,9 +1738,7 @@ def scrape_csi_only(scraper, max_divisions: int = None, max_companies: int = Non
 
         # Second pass: scrape company details
         for div_idx, division in enumerate(divisions_to_process):
-            # Format division code as XX 00 00 (e.g., "02 00 00")
-            formatted_code = f"{division.code.zfill(2)} 00 00"
-            logger.info(f"\nProcessing division {div_idx + 1}/{len(divisions_to_process)}: {formatted_code} - {division.name}")
+            logger.info(f"\nProcessing division {div_idx + 1}/{len(divisions_to_process)}: {division.code} - {division.name}")
 
             if scraper.interrupted:
                 break
