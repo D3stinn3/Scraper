@@ -1381,9 +1381,12 @@ class ARCATScraper:
         # Write data - one company per row
         row = 2
         for division in self.divisions:
+            # Format division code as "XX 00 00" (e.g., "02 00 00")
+            formatted_code = f"{division.code.zfill(2)} 00 00" if division.code.isdigit() else division.code
+
             if not division.companies:
                 # Write division even if no companies found
-                ws.cell(row=row, column=1, value=division.code)
+                ws.cell(row=row, column=1, value=formatted_code)
                 ws.cell(row=row, column=2, value=division.name)
                 ws.cell(row=row, column=13, value="ARCAT")
                 row += 1
@@ -1391,7 +1394,7 @@ class ARCATScraper:
 
             # Each company gets its own row
             for company in division.companies:
-                ws.cell(row=row, column=1, value=division.code)
+                ws.cell(row=row, column=1, value=formatted_code)
                 ws.cell(row=row, column=2, value=division.name)
                 ws.cell(row=row, column=3, value=company.building_product_category if company.building_product_category else "")
                 ws.cell(row=row, column=4, value=company.name)
@@ -1459,8 +1462,8 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='ARCAT Website Scraper with checkpoint/resume support')
-    parser.add_argument('--mode', choices=['divisions', 'categories', 'both'], default='both',
-                        help='Scraping mode: divisions (CSI specs), categories (Building Products), or both')
+    parser.add_argument('--mode', choices=['divisions', 'categories', 'both', 'csi-only'], default='csi-only',
+                        help='Scraping mode: csi-only (recommended - ~28 CSI divisions), divisions, categories, or both')
     parser.add_argument('--max-divisions', type=int, default=None,
                         help='Limit number of divisions to scrape')
     parser.add_argument('--max-categories', type=int, default=None,
@@ -1494,8 +1497,23 @@ def main():
     total_category_companies = 0
 
     try:
-        # Scrape divisions (CSI specs)
-        if args.mode in ['divisions', 'both']:
+        # CSI-Only mode (recommended - clean and fast)
+        if args.mode == 'csi-only':
+            print("\n--- CSI-ONLY MODE (Recommended) ---")
+            print("This scrapes ~28 CSI divisions with ~2,000-5,000 companies total")
+            print("Much faster than 'both' mode which has 450K+ companies!\n")
+            scrape_csi_only(
+                scraper,
+                max_divisions=args.max_divisions,
+                max_companies=args.max_companies,
+                resume=args.resume
+            )
+            total_division_companies = sum(len(d.companies) for d in scraper.divisions)
+            print(f"Divisions scraped: {len(scraper.divisions)}")
+            print(f"Companies scraped: {total_division_companies}")
+
+        # Scrape divisions (CSI specs) - legacy mode
+        elif args.mode in ['divisions', 'both']:
             print("\n--- Scraping CSI Divisions ---")
             scraper.scrape_all(
                 max_divisions=args.max_divisions,
@@ -1545,6 +1563,103 @@ def main():
         except:
             pass
         raise
+
+
+def scrape_csi_only(scraper, max_divisions: int = None, max_companies: int = None, resume: bool = False):
+    """
+    Scrape CSI divisions only - the cleanest and most focused approach.
+
+    This scrapes from https://www.arcat.com/content-type/spec which has ~28 CSI divisions.
+    Each division has companies listed. Output format matches the reference Excel structure.
+
+    Expected output: ~2,000-5,000 companies total (much more manageable than 450K)
+    """
+    logger.info("=" * 60)
+    logger.info("STARTING CSI-ONLY SCRAPE (Recommended Mode)")
+    logger.info("Source: https://www.arcat.com/content-type/spec")
+    logger.info("=" * 60)
+
+    # Track already scraped companies for resume
+    scraped_company_urls = set()
+
+    if resume:
+        checkpoint = scraper._load_checkpoint()
+        if checkpoint and checkpoint.get('mode') == 'csi-only':
+            scraper._restore_from_checkpoint(checkpoint)
+            for div in scraper.divisions:
+                for company in div.companies:
+                    if company.address:
+                        scraped_company_urls.add(company.url)
+            logger.info(f"Resuming with {len(scraped_company_urls)} already scraped companies")
+
+    try:
+        # Get all CSI divisions (should be ~28)
+        if not scraper.divisions:
+            scraper.scrape_divisions()
+
+        # Filter to valid divisions only (code 00-49)
+        valid_divisions = [d for d in scraper.divisions if d.code.isdigit() and int(d.code) <= 49]
+        logger.info(f"Found {len(valid_divisions)} valid CSI divisions")
+
+        divisions_to_process = valid_divisions[:max_divisions] if max_divisions else valid_divisions
+
+        # First pass: count total companies
+        logger.info("Counting companies across all divisions...")
+        total_companies = 0
+        for division in divisions_to_process:
+            if not division.companies:
+                scraper.scrape_division_specs(division)
+            companies = division.companies[:max_companies] if max_companies else division.companies
+            total_companies += len([c for c in companies if c.url not in scraped_company_urls])
+
+        logger.info(f"Total companies to scrape: {total_companies:,}")
+        scraper.progress.start(total_companies)
+
+        # Second pass: scrape company details
+        for div_idx, division in enumerate(divisions_to_process):
+            # Format division code as XX 00 00 (e.g., "02 00 00")
+            formatted_code = f"{division.code.zfill(2)} 00 00"
+            logger.info(f"\nProcessing division {div_idx + 1}/{len(divisions_to_process)}: {formatted_code} - {division.name}")
+
+            if scraper.interrupted:
+                break
+
+            companies_to_process = division.companies[:max_companies] if max_companies else division.companies
+
+            for company in companies_to_process:
+                if company.url in scraped_company_urls:
+                    continue
+
+                if scraper.interrupted:
+                    break
+
+                scraper.scrape_company_details(company)
+                scraper.companies_scraped_count += 1
+                scraper.progress.update()
+
+                # Periodic checkpoint
+                scraper._maybe_save_checkpoint("csi-only")
+
+                # Progress update every 10 companies
+                if scraper.companies_scraped_count % 10 == 0:
+                    logger.info(f"  {scraper.progress.get_status_line()}")
+
+            if scraper.interrupted:
+                break
+
+        if not scraper.interrupted:
+            logger.info(f"\nCSI-Only scraping complete!")
+            logger.info(f"Final: {scraper.progress.get_status_line()}")
+            scraper._save_checkpoint("csi-only")
+
+        return scraper.divisions
+
+    except Exception as e:
+        logger.error(f"Error during scraping: {e}")
+        scraper._save_checkpoint("csi-only")
+        raise
+    finally:
+        scraper.close()
 
 
 def scrape_categories_only():
