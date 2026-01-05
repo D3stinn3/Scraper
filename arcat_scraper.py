@@ -46,7 +46,7 @@ HEADERS = {
 REQUEST_DELAY = 1.5  # Delay between requests to be respectful
 
 # Checkpoint settings
-CHECKPOINT_DIR = "c:/Users/user1/Desktop/PersonalGit/Scraper/checkpoints"
+CHECKPOINT_DIR = "C:/Users/IMMIGRATION/Documents/Scraper/checkpoints"
 CHECKPOINT_INTERVAL = 10  # Save checkpoint every N companies scraped
 
 # Retry settings for connection issues
@@ -55,7 +55,7 @@ RETRY_DELAY_BASE = 5  # Base delay in seconds (will use exponential backoff)
 REQUEST_TIMEOUT = 30  # Timeout for requests in seconds
 
 # Partial save file
-PARTIAL_SAVE_FILE = "c:/Users/user1/Desktop/PersonalGit/Scraper/ARCAT_Scraped_Data_Partial.xlsx"
+PARTIAL_SAVE_FILE = "C:/Users/IMMIGRATION/Documents/Scraper/ARCAT_Scraped_Data_Partial.xlsx"
 
 # US State abbreviations to full names
 STATE_ABBREV_TO_FULL = {
@@ -1471,7 +1471,7 @@ def main():
     parser.add_argument('--max-companies', type=int, default=None,
                         help='Limit number of companies per division/category')
     parser.add_argument('--output', type=str,
-                        default="c:/Users/user1/Desktop/PersonalGit/Scraper/ARCAT_Scraped_Data.xlsx",
+                        default="C:/Users/IMMIGRATION/Documents/Scraper/ARCAT_Scraped_Data.xlsx",
                         help='Output Excel file path')
     parser.add_argument('--resume', action='store_true',
                         help='Resume from last checkpoint if available')
@@ -1671,7 +1671,7 @@ def scrape_categories_only():
 
     scraper.scrape_building_products_all()
 
-    output_file = "c:/Users/user1/Desktop/PersonalGit/Scraper/ARCAT_Scraped_Data.xlsx"
+    output_file = "C:/Users/IMMIGRATION/Documents/Scraper/ARCAT_Scraped_Data.xlsx"
     scraper.export_to_excel(output_file)
 
     print("=" * 50)
