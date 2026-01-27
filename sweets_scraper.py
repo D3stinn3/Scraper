@@ -278,6 +278,7 @@ class SWEETSScraper:
         self.progress = ProgressTracker()
         self.use_selenium = use_selenium
         self.driver = None
+        self._manufacturer_cache: Dict[str, Dict[str, str]] = {}  # Cache manufacturer contact data
 
         self._setup_checkpoint_dir()
         self._setup_signal_handlers()
@@ -533,7 +534,10 @@ class SWEETSScraper:
             return division
 
         # Find section links matching pattern: /masterformat/xxx/xxx
-        section_links = soup.find_all('a', href=re.compile(r'/masterformat/[\w-]+/[\w-]+'))
+        # Include dots in the URL pattern to catch sub-sections like:
+        #   /masterformat/masonry-04-00-00/unit-masonry-stabilization-04-01-20.41
+        #   /masterformat/masonry-04-00-00/granite--04-40-00.17
+        section_links = soup.find_all('a', href=re.compile(r'/masterformat/[\w-]+/[\w.%-]+'))
 
         seen_urls = set()
         for link in section_links:
@@ -545,9 +549,16 @@ class SWEETSScraper:
             text = link.get_text(strip=True)
             full_url = f"{BASE_URL}{href}"
 
-            # Parse code and name - may have format "01 76 00 - 01 76 00 - Name" or "01 76 00 - Name"
-            # Try different patterns
-            match = re.match(r'^(\d+\s+\d+\s+\d+)\s*-\s*(?:\d+\s+\d+\s+\d+\s*-\s*)?(.+)$', text)
+            # Parse code and name from text like:
+            #   "01 76 00 - Protecting Installed Construction"
+            #   "04 01 20 - 04 01 20 - Maintenance of Unit Masonry"
+            #   "04 05 23.19 - Masonry Cavity Drainage Weepholes And Vents"
+            #   "04 40 00.17 - Granite"
+            # Support dotted sub-codes like "04 01 20.41"
+            match = re.match(
+                r'^(\d+\s+\d+\s+\d+(?:\.\d+)?)\s*-\s*(?:\d+\s+\d+\s+\d+(?:\.\d+)?\s*-\s*)?(.+)$',
+                text
+            )
             if match:
                 code = match.group(1)
                 name = match.group(2).strip()
@@ -626,6 +637,188 @@ class SWEETSScraper:
         logger.info(f"  Found {len(section.products)} products in section {section.code}")
         return section
 
+    def _scrape_manufacturer_contact(self, manufacturer_id: str) -> Dict[str, str]:
+        """Fallback: scrape the manufacturer's main page for contact info.
+
+        URL pattern: /manufacturer/{manufacturer-id}
+        """
+        mfr_url = f"{BASE_URL}/manufacturer/{manufacturer_id}"
+        logger.debug(f"Fetching manufacturer page for missing address: {mfr_url}")
+
+        try:
+            html = self._make_request_raw(mfr_url)
+            if not html:
+                return {}
+
+            soup = BeautifulSoup(html, 'html.parser')
+            company_info_div = soup.find('div', class_='companyInfo')
+            if company_info_div:
+                address_tag = company_info_div.find('address')
+                if address_tag:
+                    return self._parse_address_tag(address_tag)
+        except Exception as e:
+            logger.debug(f"Failed to scrape manufacturer page {mfr_url}: {e}")
+
+        return {}
+
+    def _parse_address_tag(self, address_tag, manufacturer_name: str = "") -> Dict[str, str]:
+        """Parse the <address> tag from companyInfo div to extract contact details.
+
+        The <address> tag has a consistent structure with <br>-separated lines:
+            <br>Company Name
+            <br>Street Line 1
+            <br>Street Line 2 (optional, e.g. Suite/P.O. Box)
+            <br>City, ST ZIP
+            <br>Tel: (XXX) XXX-XXXX
+            <br>Fax: (XXX) XXX-XXXX
+            <p><a href="mailto:email">email</a></p>
+            <p><a href="https://website">website</a></p>
+        """
+        result = {
+            'address': '', 'city': '', 'state': '', 'zip_code': '',
+            'phone': '', 'fax': '', 'email': '', 'website': ''
+        }
+
+        if not address_tag:
+            return result
+
+        # Extract email from mailto link within the address tag
+        excluded_email_domains = ['construction.com', 'sweets.com', 'sso.construction.com',
+                                  'noreply', 'donotreply', 'unsubscribe']
+        mailto_link = address_tag.find('a', href=re.compile(r'^mailto:', re.IGNORECASE))
+        if mailto_link:
+            email = re.sub(r'^mailto:', '', mailto_link.get('href', ''), flags=re.IGNORECASE).strip()
+            if not any(exc in email.lower() for exc in excluded_email_domains):
+                result['email'] = email
+
+        # Extract website from links within the address tag
+        excluded_domains = ['construction.com', 'sweets.com', 'sso.construction.com',
+                          'facebook.com', 'linkedin.com', 'twitter.com', 'instagram.com',
+                          'youtube.com', 'google.com', 'pinterest.com', 'tiktok.com',
+                          'amazonaws.com', 'cloudfront.net', 'cloudflare.com',
+                          'googleapis.com', 'gstatic.com', 'bootstrapcdn.com', 'jquery.com',
+                          'fontawesome.com', 'microsoft.com', 'bing.com', 'w3.org', 'schema.org',
+                          'doubleclick.net', 'googlesyndication.com', 'googletagmanager.com']
+
+        for link in address_tag.find_all('a', href=re.compile(r'^https?://')):
+            href = link.get('href', '')
+            # Skip mailto, javascript, and anchor links
+            if href.startswith('mailto:') or href.startswith('javascript:'):
+                continue
+            domain_match = re.search(r'https?://(?:www\.)?([a-zA-Z0-9.-]+)', href)
+            if domain_match:
+                domain_str = domain_match.group(1).lower()
+                if not any(exc in domain_str for exc in excluded_domains):
+                    if not any(ext in href.lower() for ext in ['.js', '.css', '.png', '.jpg', '.gif', '.ico']):
+                        result['website'] = href.rstrip('/')
+                        break
+
+        # Get text content split by <br> tags
+        # Replace <br> tags with a delimiter, then split
+        address_html = str(address_tag)
+        # Replace <br>, <br/>, <br /> with delimiter
+        address_html = re.sub(r'<br\s*/?\s*>', '\n', address_html, flags=re.IGNORECASE)
+        # Remove all other HTML tags
+        address_text = re.sub(r'<[^>]+>', '', address_html)
+        lines = [line.strip() for line in address_text.split('\n') if line.strip()]
+
+        # Parse lines sequentially
+        address_lines = []
+        city_state_found = False
+
+        for line in lines:
+            # Skip company name (first non-empty line, matches manufacturer)
+            # Skip "Find a rep" and "Request More Info" type lines
+            if any(skip in line.lower() for skip in ['find a rep', 'request more info', 'request info']):
+                continue
+
+            # Check for Tel: line
+            tel_match = re.match(r'Tel:\s*(.+)', line, re.IGNORECASE)
+            if tel_match:
+                phone_raw = tel_match.group(1).strip()
+                # Normalize phone format
+                phone_digits = re.match(r'\((\d{3})\)\s*(\d{3})-(\d{4})', phone_raw)
+                if phone_digits:
+                    result['phone'] = f"({phone_digits.group(1)}) {phone_digits.group(2)}-{phone_digits.group(3)}"
+                else:
+                    phone_digits2 = re.match(r'(\d{3})[-.\s](\d{3})[-.\s](\d{4})', phone_raw)
+                    if phone_digits2:
+                        result['phone'] = f"({phone_digits2.group(1)}) {phone_digits2.group(2)}-{phone_digits2.group(3)}"
+                    else:
+                        result['phone'] = phone_raw
+                continue
+
+            # Check for Fax: line
+            fax_match = re.match(r'Fax:\s*(.+)', line, re.IGNORECASE)
+            if fax_match:
+                fax_raw = fax_match.group(1).strip()
+                fax_digits = re.match(r'\((\d{3})\)\s*(\d{3})-(\d{4})', fax_raw)
+                if fax_digits:
+                    result['fax'] = f"({fax_digits.group(1)}) {fax_digits.group(2)}-{fax_digits.group(3)}"
+                else:
+                    fax_digits2 = re.match(r'(\d{3})[-.\s](\d{3})[-.\s](\d{4})', fax_raw)
+                    if fax_digits2:
+                        result['fax'] = f"({fax_digits2.group(1)}) {fax_digits2.group(2)}-{fax_digits2.group(3)}"
+                    else:
+                        result['fax'] = fax_raw
+                continue
+
+            # Skip email/website text lines (already extracted from links)
+            if '@' in line or line.startswith('http'):
+                continue
+
+            if city_state_found:
+                continue
+
+            # Check for "City, ST ZIP" pattern (US)
+            city_state_zip = re.match(
+                r'^([A-Za-z][A-Za-z\s.]+?),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$', line
+            )
+            if city_state_zip:
+                result['city'] = city_state_zip.group(1).strip()
+                state_abbr = city_state_zip.group(2).strip()
+                result['state'] = STATE_ABBREV_TO_FULL.get(state_abbr, state_abbr)
+                result['zip_code'] = city_state_zip.group(3).strip()
+                city_state_found = True
+                continue
+
+            # Check for Canadian "City, Province PostalCode" pattern
+            city_state_ca = re.match(
+                r'^([A-Za-z][A-Za-z\s.]+?),\s*([A-Z]{2})\s+([A-Z]\d[A-Z]\s*\d[A-Z]\d)$', line
+            )
+            if city_state_ca:
+                result['city'] = city_state_ca.group(1).strip()
+                state_abbr = city_state_ca.group(2).strip()
+                result['state'] = STATE_ABBREV_TO_FULL.get(state_abbr, state_abbr)
+                result['zip_code'] = city_state_ca.group(3).strip()
+                city_state_found = True
+                continue
+
+            # Check for "City, Province/State PostalCode" with full province name
+            city_prov_ca = re.match(
+                r'^([A-Za-z][A-Za-z\s.]+?),\s*([A-Za-z\s]+?)\s+([A-Z]\d[A-Z]\s*\d[A-Z]\d)$', line
+            )
+            if city_prov_ca:
+                result['city'] = city_prov_ca.group(1).strip()
+                result['state'] = city_prov_ca.group(2).strip()
+                result['zip_code'] = city_prov_ca.group(3).strip()
+                city_state_found = True
+                continue
+
+            # Otherwise, this is an address line (street, P.O. Box, suite, etc.)
+            address_lines.append(line)
+
+        # Build address from collected lines (skip the first line if it matches manufacturer name)
+        if address_lines:
+            # The first line might be the company name - skip it if it matches
+            if manufacturer_name and address_lines[0].lower().replace(',', '').replace('.', '') == \
+               manufacturer_name.lower().replace(',', '').replace('.', ''):
+                address_lines = address_lines[1:]
+
+            result['address'] = ', '.join(address_lines)
+
+        return result
+
     def scrape_product_details(self, product: Product) -> Product:
         """Scrape detailed product/company information from product page"""
         logger.debug(f"Scraping product: {product.manufacturer_name} - {product.name}")
@@ -636,100 +829,112 @@ class SWEETSScraper:
 
         soup = BeautifulSoup(html, 'html.parser')
 
-        # Extract company contact information using multiple patterns
+        # ===== PRIMARY: Parse <address> tag from companyInfo div =====
+        company_info_div = soup.find('div', class_='companyInfo')
+        address_tag = None
+        if company_info_div:
+            address_tag = company_info_div.find('address')
 
-        # ===== PHONE =====
-        # Pattern 1: Tel: (XXX) XXX-XXXX
-        tel_match = re.search(r'Tel:\s*\((\d{3})\)\s*(\d{3})-(\d{4})', html)
-        if tel_match:
-            product.phone = f"({tel_match.group(1)}) {tel_match.group(2)}-{tel_match.group(3)}"
+        if address_tag:
+            contact = self._parse_address_tag(address_tag, product.manufacturer_name)
+            product.phone = contact['phone']
+            product.fax = contact['fax']
+            product.email = contact['email']
+            product.website = contact['website']
+            product.address = contact['address']
+            product.city = contact['city']
+            product.state = contact['state']
+            product.zip_code = contact['zip_code']
         else:
-            # Pattern 2: Tel: XXX-XXX-XXXX or Tel: XXX.XXX.XXXX
-            tel_match2 = re.search(r'Tel:\s*(\d{3})[-.\s](\d{3})[-.\s](\d{4})', html)
-            if tel_match2:
-                product.phone = f"({tel_match2.group(1)}) {tel_match2.group(2)}-{tel_match2.group(3)}"
+            # ===== FALLBACK: Regex-based extraction if no <address> tag =====
+            logger.debug(f"No <address> tag found for {product.manufacturer_name}, using regex fallback")
+
+            # Phone
+            tel_match = re.search(r'Tel:\s*\((\d{3})\)\s*(\d{3})-(\d{4})', html)
+            if tel_match:
+                product.phone = f"({tel_match.group(1)}) {tel_match.group(2)}-{tel_match.group(3)}"
             else:
-                # Pattern 3: Any phone number on the page (fallback)
-                phone_match = re.search(r'(?<!Fax:\s)(?<!\d)\((\d{3})\)\s*(\d{3})-(\d{4})(?!\d)', html)
-                if phone_match:
-                    product.phone = f"({phone_match.group(1)}) {phone_match.group(2)}-{phone_match.group(3)}"
+                tel_match2 = re.search(r'Tel:\s*(\d{3})[-.\s](\d{3})[-.\s](\d{4})', html)
+                if tel_match2:
+                    product.phone = f"({tel_match2.group(1)}) {tel_match2.group(2)}-{tel_match2.group(3)}"
 
-        # ===== FAX =====
-        fax_match = re.search(r'Fax:\s*\((\d{3})\)\s*(\d{3})-(\d{4})', html)
-        if fax_match:
-            product.fax = f"({fax_match.group(1)}) {fax_match.group(2)}-{fax_match.group(3)}"
-        else:
-            fax_match2 = re.search(r'Fax:\s*(\d{3})[-.\s](\d{3})[-.\s](\d{4})', html)
-            if fax_match2:
-                product.fax = f"({fax_match2.group(1)}) {fax_match2.group(2)}-{fax_match2.group(3)}"
+            # Fax
+            fax_match = re.search(r'Fax:\s*\((\d{3})\)\s*(\d{3})-(\d{4})', html)
+            if fax_match:
+                product.fax = f"({fax_match.group(1)}) {fax_match.group(2)}-{fax_match.group(3)}"
 
-        # ===== EMAIL =====
-        # Find all emails and filter out unwanted ones
-        email_matches = re.findall(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', html)
-        excluded_email_domains = ['construction.com', 'sweets.com', 'noreply', 'donotreply', 'unsubscribe']
-        for email in email_matches:
-            if not any(exc in email.lower() for exc in excluded_email_domains):
-                product.email = email
-                break
+            # Email
+            email_matches = re.findall(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', html)
+            excluded_email_domains = ['construction.com', 'sweets.com', 'noreply', 'donotreply', 'unsubscribe']
+            for email in email_matches:
+                if not any(exc in email.lower() for exc in excluded_email_domains):
+                    product.email = email
+                    break
 
-        # ===== WEBSITE =====
-        # Look for company website - find href links that are external
-        excluded_domains = ['construction.com', 'sweets.com', 'facebook.com', 'linkedin.com', 'twitter.com',
-                          'instagram.com', 'youtube.com', 'google.com', 'pinterest.com', 'tiktok.com',
-                          'amazonaws.com', 'cloudfront.net', 'cloudflare.com', 'cdnjs.cloudflare.com',
-                          'googleapis.com', 'gstatic.com', 'bootstrapcdn.com', 'jquery.com',
-                          'fontawesome.com', 'microsoft.com', 'bing.com', 'w3.org', 'schema.org',
-                          'doubleclick.net', 'googlesyndication.com', 'googletagmanager.com']
+            # Website
+            excluded_domains = ['construction.com', 'sweets.com', 'facebook.com', 'linkedin.com', 'twitter.com',
+                              'instagram.com', 'youtube.com', 'google.com', 'pinterest.com', 'tiktok.com',
+                              'amazonaws.com', 'cloudfront.net', 'cloudflare.com',
+                              'googleapis.com', 'gstatic.com', 'bootstrapcdn.com', 'jquery.com',
+                              'fontawesome.com', 'microsoft.com', 'bing.com', 'w3.org', 'schema.org',
+                              'doubleclick.net', 'googlesyndication.com', 'googletagmanager.com']
+            website_links = re.findall(r'href="(https?://(?:www\.)?[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/?)"', html)
+            for url in website_links:
+                domain = re.search(r'https?://(?:www\.)?([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', url)
+                if domain:
+                    domain_str = domain.group(1).lower()
+                    if not any(exc in domain_str for exc in excluded_domains):
+                        if not any(ext in url.lower() for ext in ['.js', '.css', '.png', '.jpg', '.gif', '.ico', '.woff', '.svg']):
+                            product.website = url.rstrip('/')
+                            break
 
-        # First try to find links that look like company websites (not CDN/resources)
-        website_links = re.findall(r'href="(https?://(?:www\.)?[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/?)"', html)
-        for url in website_links:
-            domain = re.search(r'https?://(?:www\.)?([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', url)
-            if domain:
-                domain_str = domain.group(1).lower()
-                # Skip CDN, social media, and utility domains
-                if not any(exc in domain_str for exc in excluded_domains):
-                    # Skip URLs that look like resource files
-                    if not any(ext in url.lower() for ext in ['.js', '.css', '.png', '.jpg', '.gif', '.ico', '.woff', '.svg']):
-                        product.website = url.rstrip('/')
-                        break
-
-        # If no website found, try looking for links near company name text
-        if not product.website:
-            # Look for company-specific link patterns in href
-            company_link_pattern = re.findall(r'href="(https?://(?:www\.)?[\w-]+\.(?:com|net|org|co|io)/?)"[^>]*>[^<]*(?:website|visit|homepage)', html, re.IGNORECASE)
-            if company_link_pattern:
-                for url in company_link_pattern:
-                    domain = re.search(r'https?://(?:www\.)?([a-zA-Z0-9.-]+)', url)
-                    if domain and not any(exc in domain.group(1).lower() for exc in excluded_domains):
-                        product.website = url.rstrip('/')
-                        break
-
-        # ===== ADDRESS =====
-        # Pattern: "Address","City","ST","ZIP" in HTML
-        # Pattern 1: >Address<...>City, ST ZIP< (common HTML structure)
-        addr_pattern1 = re.search(
-            r'>(\d+\s+[^<]+(?:Circle|Street|St|Ave|Avenue|Road|Rd|Drive|Dr|Blvd|Boulevard|Way|Lane|Ln|Parkway|Pkwy|Place|Pl|Court|Ct)\.?[^<]*)<[^>]*>([A-Za-z\s]+),?\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)<',
-            html, re.IGNORECASE
-        )
-        if addr_pattern1:
-            product.address = addr_pattern1.group(1).strip()
-            product.city = addr_pattern1.group(2).strip()
-            state_abbr = addr_pattern1.group(3).strip()
-            product.state = STATE_ABBREV_TO_FULL.get(state_abbr, state_abbr)
-            product.zip_code = addr_pattern1.group(4).strip()
-        else:
-            # Pattern 2: Single line with address, city, state, zip
-            addr_pattern2 = re.search(
-                r'(\d+\s+[\w\s]+(?:Circle|Street|St|Ave|Avenue|Road|Rd|Drive|Dr|Blvd|Boulevard|Way|Lane|Ln|Parkway|Pkwy|Place|Pl|Court|Ct)\.?)[,\s]+([A-Za-z\s]+),?\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)',
-                html
+            # Address (regex fallback)
+            addr_pattern = re.search(
+                r'>([^<]+)<[^>]*>([A-Za-z][A-Za-z\s.]+?),?\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)<',
+                html, re.IGNORECASE
             )
-            if addr_pattern2:
-                product.address = addr_pattern2.group(1).strip()
-                product.city = addr_pattern2.group(2).strip()
-                state_abbr = addr_pattern2.group(3).strip()
+            if addr_pattern:
+                product.address = addr_pattern.group(1).strip()
+                product.city = addr_pattern.group(2).strip()
+                state_abbr = addr_pattern.group(3).strip()
                 product.state = STATE_ABBREV_TO_FULL.get(state_abbr, state_abbr)
-                product.zip_code = addr_pattern2.group(4).strip()
+                product.zip_code = addr_pattern.group(4).strip()
+
+        # ===== MANUFACTURER PAGE FALLBACK =====
+        # If address is still blank, try the manufacturer's main page
+        if not product.address and product.manufacturer_id:
+            cached = self._manufacturer_cache.get(product.manufacturer_id)
+            if cached is not None:
+                # Use cached data (could be empty dict if already tried and failed)
+                if cached:
+                    product.address = cached.get('address', '')
+                    product.city = cached.get('city', '')
+                    product.state = cached.get('state', '')
+                    product.zip_code = cached.get('zip_code', '')
+                    if not product.phone:
+                        product.phone = cached.get('phone', '')
+                    if not product.fax:
+                        product.fax = cached.get('fax', '')
+                    if not product.email:
+                        product.email = cached.get('email', '')
+                    if not product.website:
+                        product.website = cached.get('website', '')
+            else:
+                mfr_contact = self._scrape_manufacturer_contact(product.manufacturer_id)
+                self._manufacturer_cache[product.manufacturer_id] = mfr_contact
+                if mfr_contact:
+                    product.address = mfr_contact.get('address', '')
+                    product.city = mfr_contact.get('city', '')
+                    product.state = mfr_contact.get('state', '')
+                    product.zip_code = mfr_contact.get('zip_code', '')
+                    if not product.phone:
+                        product.phone = mfr_contact.get('phone', '')
+                    if not product.fax:
+                        product.fax = mfr_contact.get('fax', '')
+                    if not product.email:
+                        product.email = mfr_contact.get('email', '')
+                    if not product.website:
+                        product.website = mfr_contact.get('website', '')
 
         # ===== CATEGORY/MASTERFORMAT =====
         category_match = re.search(r'Category:\s*</strong>\s*([^<]+)', html)
